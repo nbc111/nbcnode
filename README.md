@@ -126,3 +126,206 @@ graph LR
 - [NEAR RPC 文档](https://docs.near.org/api/rpc)
 - [NEP-141 Fungible Token 标准](https://nomicon.io/Standards/FungibleToken/Core)
 - [NEAR Core GitHub](https://github.com/near/nearcore)
+
+
+中心化交易所（CEX）集成 NEAR 公链充提功能的 **完整技术实现方案**，共分 6 个核心步骤，包含关键代码示例和注意事项：
+
+---
+
+### 一、节点部署与同步
+#### 1. **部署 NEAR 节点**
+```bash
+# 安装依赖
+sudo apt install -y nodejs git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 部署归档节点（需 2TB+ SSD）
+git clone https://github.com/near/nearcore
+cd nearcore
+make release
+./target/release/neard --home ~/.near init --chain-id mainnet --download-genesis
+```
+
+#### 2. **配置 RPC 服务**
+```nginx
+# Nginx 反向代理配置
+server {
+    listen 443 ssl;
+    server_name near-rpc.yourcex.com;
+    location / {
+        proxy_pass http://localhost:3030;
+        proxy_set_header Host $host;
+    }
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+}
+```
+
+#### 3. **节点监控（Prometheus）**
+```yaml
+# prometheus.yml 配置
+scrape_configs:
+  - job_name: 'near_node'
+    static_configs:
+      - targets: ['node_ip:3030']  # 监控指标端口
+```
+
+---
+
+### 二、钱包管理系统开发
+#### 1. **HD 钱包架构**
+```python
+# Python 示例（使用 bip32utils）
+from bip32utils import BIP32Key
+from bip32utils import BIP32_HARDEN
+
+master_key = BIP32Key.fromEntropy(os.urandom(16))
+user_key = master_key.ChildKey(0).ChildKey(user_id + BIP32_HARDEN)
+near_address = f"{user_key.Address()}.yourcex.near"
+```
+
+#### 2. **冷热钱包分离方案**
+| **钱包类型** | **资金比例** | **签名方式** | **安全措施** |
+|-------------|-------------|-------------|-------------|
+| 热钱包       | <5%         | 自动签名     | 多签+IP白名单 |
+| 温钱包       | 10-15%      | 人工审核     | 地理围栏 |
+| 冷钱包       | >80%        | 离线签名     | 物理隔离 |
+
+---
+
+### 三、充值监听实现
+#### 1. **交易监听脚本**
+```javascript
+// 使用 near-api-js
+const { connect } = require('near-api-js');
+
+const monitorDeposits = async () => {
+  const near = await connect({ network: 'mainnet' });
+  const blockStream = near.connection.provider.blockStream();
+  
+  blockStream.subscribe(block => {
+    block.transactions.forEach(tx => {
+      if (tx.receiver_id.endsWith('.yourcex.near')) {
+        processDeposit(tx.sender_id, tx.amount);
+      }
+    });
+  });
+};
+```
+
+#### 2. **交易确认逻辑**
+```python
+# 确认数检查（6个区块）
+def is_confirmed(tx_hash):
+    current_height = get_block_height()
+    tx_block = get_tx_block(tx_hash)
+    return current_height - tx_block >= 6
+```
+
+---
+
+### 四、提现系统实现
+#### 1. **提现 API 设计**
+```python
+# Flask 提现接口示例
+@app.route('/withdraw', methods=['POST'])
+def withdraw():
+    user_id = request.json['user_id']
+    amount = Decimal(request.json['amount'])
+    address = request.json['address']
+    
+    # 1. 验证余额
+    if not check_balance(user_id, amount):
+        return {"error": "Insufficient balance"}, 400
+    
+    # 2. 构造交易
+    tx_hash = create_transaction(
+        from_address=get_hot_wallet(),
+        to_address=address,
+        amount=amount - FEE  # 扣除手续费
+    )
+    
+    # 3. 记录提现
+    save_withdrawal(user_id, tx_hash, amount)
+    return {"tx_hash": tx_hash}
+```
+
+#### 2. **交易签名流程
+```mermaid
+graph LR
+A[用户提现请求] --> B{金额≤阈值?}
+B -->|是| C[热钱包自动签名]
+B -->|否| D[人工审核]
+D --> E[离线签名机]
+E --> F[广播交易]
+```
+
+---
+
+### 五、安全风控系统
+#### 1. 风控规则示例
+```python
+# 风控检查函数
+def risk_control(withdraw_request):
+    if withdraw_request['amount'] > DAILY_LIMIT[user['level']]:
+        return False, "Exceed daily limit"
+    
+    if is_high_risk_address(withdraw_request['address']):
+        return False, "High risk address"
+    
+    if get_last_withdraw_time(user) < TIME_LIMIT:
+        return False, "Too frequent"
+    
+    return True, ""
+```
+
+#### 2. 安全审计要点
+1. **私钥存储**：使用 HSM 或 AWS KMS
+2. **交易重放保护**：检查 nonce 值
+3. **阈值签名**：实现 MPC 钱包
+4. **漏洞扫描**：每月进行渗透测试
+
+---
+
+### 六、用户界面集成
+#### 1. 前端显示要素
+```jsx
+// React 充值界面组件
+function NearDeposit() {
+  return (
+    <div>
+      <h3>NEAR Deposit</h3>
+      <p>Your exclusive address: <b>{user.nearAddress}</b></p>
+      <QrCode value={user.nearAddress} size={128} />
+      <p>Minimum deposit: 0.01 NEAR</p>
+      <TransactionHistory chain="NEAR" />
+    </div>
+  )
+}
+```
+
+#### 2. 状态监控看板
+| **指标**         | **监控方式**               | **报警阈值**   |
+|------------------|--------------------------|---------------|
+| 节点同步状态      | Prometheus+AlertManager | 延迟 > 60s    |
+| 热钱包余额        | 定时任务                 | < 100 NEAR    |
+| 未确认充值        | 数据库扫描               | > 30 分钟     |
+| 异常提现尝试      | 日志分析                 | 5次/分钟      |
+
+---
+
+### 关键注意事项
+1. **账户创建费**：首次充值到新地址需预留 0.00185 NEAR（当前主网费率）
+2. **精度处理**：所有数值计算使用 `BigDecimal` 或 `BN.js`
+3. **分片处理**：跨分片交易需特殊处理（使用 `shard_id` 参数）
+4. **灾备方案**：
+   - 备用 RPC 节点：至少 3 个地理分散节点
+   - 自动切换：当主节点延迟 > 5s 时自动切换
+
+> **上线前测试清单**：
+> 1. 测试网完整充提流程（10+ 交易）
+> 2. 模拟节点故障恢复
+> 3. 大额交易压力测试（100+ TPS）
+> 4. 安全审计报告验证
+
+通过以上实现，交易所可在 **4-6 周** 内完成 NEAR 集成。建议使用 NEAR 官方提供的 [Exchange Integration Guide](https://docs.near.org/docs/roles/integrator/exchange-integration) 作为补充参考。
